@@ -1,0 +1,7 @@
+version: '1'
+tunnels:
+  face-web:
+    proto: http
+    addr: 5000
+    # Uncomment để đặt domain cố định (cần ngrok Pro):
+    # hostname: your-custom-domain.ngrok.io

@@ -1,0 +1,44 @@
+# ── Python ──────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+.pytest_cache/
+
+# ── Virtual environments ─────────────────────────
+.venv/
+venv/
+env/
+.env.local
+.env.production
+
+# ── Secrets (KHÔNG push lên GitHub) ─────────────
+# .env          ← Uncomment nếu muốn bảo mật tuyệt đối
+# ngrok.yml     ← Chứa NGROK_AUTHTOKEN
+
+# ── AI Model weights (file lớn — dùng Git LFS hoặc bỏ qua) ──
+*.pth
+*.pt
+*.onnx
+*.bin
+*.tar
+*.weights
+
+# ── Data (database & faces) ──────────────────────
+data/persons.db
+data/faiss.index
+data/faces/
+
+# ── IDE & OS ──────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ── Logs ─────────────────────────────────────────
+*.log
+logs/
+
+# ── Docker build cache ────────────────────────────
+.dockerignore

@@ -1,0 +1,45 @@
+# ============================================================
+# Dockerfile.web — Web Mode (FastAPI + Camera, no PyQt5/X11)
+# ============================================================
+FROM python:3.9-slim
+
+# Biến môi trường
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    DEBIAN_FRONTEND=noninteractive
+
+# Cài thư viện hệ thống (OpenCV headless + build tools)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    libgomp1 \
+    ffmpeg \
+    wget \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Cài Python dependencies
+COPY requirements.txt requirements-web.txt ./
+RUN pip install --no-cache-dir -r requirements.txt -r requirements-web.txt
+
+# Copy source code
+COPY . .
+
+# Tạo thư mục cần thiết
+RUN mkdir -p data/faces weights web
+
+# Expose cổng FastAPI
+EXPOSE 5000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:5000/api/status || exit 1
+
+# Chạy FastAPI server
+CMD ["python", "-m", "uvicorn", "app_web:app", "--host", "0.0.0.0", "--port", "5000", "--workers", "1"]

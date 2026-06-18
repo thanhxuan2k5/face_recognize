@@ -1,0 +1,67 @@
+version: '3.8'
+
+services:
+  # ── Web / API Mode (FastAPI + Camera) ──────────────────────────
+  face-web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    image: facerecognize-web
+    container_name: face_ai_web
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+    environment:
+      - CAMERA_INDEX=0
+    volumes:
+      - ./data:/app/data          # SQLite DB + FAISS index
+      - ./weights:/app/weights    # Model weights
+      - ./web:/app/web            # HTML UI files
+      - ./utils/config.py:/app/utils/config.py
+    # Webcam access (Linux/Mac)
+    # devices:
+    #   - /dev/video0:/dev/video0
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/api/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # ── Ngrok Tunnel (expose ra internet) ──────────────────────────
+  ngrok:
+    image: ngrok/ngrok:latest
+    container_name: face_ai_ngrok
+    depends_on:
+      - face-web
+    environment:
+      - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN}
+    command: http face-web:5000 --log=stdout
+    ports:
+      - "4040:4040"   # Ngrok web dashboard
+    restart: unless-stopped
+    profiles:
+      - ngrok   # Chỉ start khi chạy: docker-compose --profile ngrok up
+
+  # ── Desktop GUI Mode (PyQt5, cần X11) ──────────────────────────
+  face-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: facerecognize
+    container_name: face_ai_desktop
+    network_mode: "host"
+    environment:
+      - DISPLAY=${DISPLAY:-:0}
+      - QT_X11_NO_MITSHM=1
+      - CAMERA_INDEX=0
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - ./data:/app/data
+      - ./weights:/app/weights
+      - ./utils/config.py:/app/utils/config.py
+    restart: "no"
+    profiles:
+      - desktop   # Chỉ start khi chạy: docker-compose --profile desktop up
