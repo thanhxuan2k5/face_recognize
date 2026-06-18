@@ -24,9 +24,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Cài Python dependencies
-COPY requirements.txt requirements-web.txt ./
-RUN pip install --no-cache-dir -r requirements.txt -r requirements-web.txt
+# Cài Python dependencies (web-only, không cần PyQt5)
+COPY requirements-web.txt ./
+RUN pip install --no-cache-dir -r requirements-web.txt
 
 # Copy source code
 COPY . .
