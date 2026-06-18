@@ -19,9 +19,10 @@ services:
       - ./weights:/app/weights    # Model weights
       - ./web:/app/web            # HTML UI files
       - ./utils/config.py:/app/utils/config.py
-    # Webcam access (Linux/Mac)
-    # devices:
-    #   - /dev/video0:/dev/video0
+    # Webcam access (Linux) — uncomment nếu dùng webcam USB
+    devices:
+      - /dev/video0:/dev/video0
+
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000/api/status"]

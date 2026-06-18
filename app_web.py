@@ -257,7 +257,7 @@ def _process_loop():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Khởi tạo AI pipeline khi server start."""
-    log.info("Khởi tạo AI pipeline...")
+    log.info("Initializing AI pipeline...")
     state.db = DBManager()
     state.feature_store = FeatureStore()
     state.embed_cache = EmbeddingCache()
@@ -274,7 +274,7 @@ async def lifespan(app: FastAPI):
         state.anti_spoof = AntiSpoof()
         state.detector = FaceDetector()
         state.embedder = FaceEmbedder()
-        log.info("Tải mô hình AI thành công.")
+        log.info("AI models loaded successfully.")
     except Exception as exc:
         log.error("Lỗi tải mô hình: %s", exc)
 
@@ -293,12 +293,12 @@ async def lifespan(app: FastAPI):
     state.processor_thread = threading.Thread(target=_process_loop, daemon=True, name="processor")
     state.camera_thread.start()
     state.processor_thread.start()
-    log.info("Server sẵn sàng.")
+    log.info("Server ready.")
 
     yield
 
     # Shutdown
-    log.info("Dọn dẹp...")
+    log.info("Shutting down...")
     state._running = False
     if state.feature_store:
         state.feature_store.searcher.save()
