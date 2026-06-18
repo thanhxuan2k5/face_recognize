@@ -1,7 +1,5 @@
-version: '3.8'
-
 services:
-  # ── Web / API Mode (FastAPI + Camera) ──────────────────────────
+  # ── Web / API Mode (FastAPI — Stateless AI Backend) ─────────────
   face-web:
     build:
       context: .
@@ -12,17 +10,11 @@ services:
       - "5000:5000"
     env_file:
       - .env
-    environment:
-      - CAMERA_INDEX=0
     volumes:
       - ./data:/app/data          # SQLite DB + FAISS index
       - ./weights:/app/weights    # Model weights
       - ./web:/app/web            # HTML UI files
       - ./utils/config.py:/app/utils/config.py
-    # Webcam access (Linux) — uncomment nếu dùng webcam USB
-    devices:
-      - /dev/video0:/dev/video0
-
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000/api/status"]
