@@ -1,28 +1,23 @@
 """
-app_web.py — FastAPI Web Server cho Face Recognition App
-Chạy độc lập với PyQt5 GUI, dùng chung AI core.
+app_web.py — FastAPI Web Server (Industry Standard Edge-Cloud Architecture)
+Server đóng vai trò nhận ảnh từ các Client (Web/Thiết bị nhúng) gửi lên, xử lý và trả kết quả JSON.
 """
 from __future__ import annotations
 
-import asyncio
 import base64
-import io
-import queue
-import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from utils.config import CAMERA_INDEX, CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS, FRAME_QUEUE_MAXSIZE
 from utils.logger import get_logger
 from database.db_manager import DBManager, Person
 from database.feature_store import FeatureStore
@@ -43,213 +38,96 @@ class AppState:
         self.anti_spoof = None
         self.embed_cache: Optional[EmbeddingCache] = None
 
-        self.camera_thread: Optional[threading.Thread] = None
-        self.processor_thread: Optional[threading.Thread] = None
-        self._cap: Optional[cv2.VideoCapture] = None
-        self._running = False
-        self._lock = threading.Lock()
-
-        # Latest processed frame (BGR numpy array with overlays)
-        self.latest_frame: Optional[np.ndarray] = None
-        self.latest_faces: List[Dict] = []
-        self.fps: float = 0.0
-        self._frame_lock = threading.Lock()
+        # Caching identity for performance across stateless requests (based on track_id if available)
+        self.identity_cache: Dict[int, tuple] = {}
+        self.liveness_cache: Dict[int, tuple] = {}
+        self.db_names: Dict[int, str] = {}
 
 state = AppState()
 
+# ── Core AI Processing Logic ──────────────────────────────────────────────────
 
-# ── Camera + AI Thread (non-Qt) ────────────────────────────────────────────────
+def process_frame_stateless(frame: np.ndarray, client_id: str = "default") -> dict:
+    """Xử lý 1 bức ảnh và trả về danh sách khuôn mặt (Dùng chung cho API và WebSocket)"""
+    t0 = time.perf_counter()
+    
+    if state.detector is None:
+        return {"error": "AI models not loaded"}
 
-def _draw_overlay(frame: np.ndarray, faces: List[Dict]) -> np.ndarray:
-    """Vẽ bounding box và label lên frame."""
-    out = frame.copy()
-    for f in faces:
-        x1, y1, x2, y2 = [int(v) for v in f.get("bbox", [0, 0, 0, 0])]
-        pid = f.get("person_id")
-        sim = f.get("similarity", 0.0) or 0.0
-        is_real = f.get("is_real", True)
-        name = f.get("name", "Unknown")
+    # Detection
+    raw_dets = state.detector.detect(frame)
+    if not raw_dets:
+        return {"faces": [], "process_time_ms": int((time.perf_counter() - t0) * 1000)}
 
-        # Box color
-        if pid and is_real:
-            color = (0, 220, 100)      # green — known & real
-        elif pid and not is_real:
-            color = (0, 140, 255)      # orange — known but fake
-        elif is_real:
-            color = (255, 200, 0)      # blue — unknown but real
-        else:
-            color = (0, 0, 220)        # red — spoof
+    # Track (mỗi client_id có thể cần tracker riêng để không bị lẫn lộn track_id)
+    # Tuy nhiên vì làm đơn giản, ta dùng tracker chung hoặc bỏ qua tracker nếu gửi từ nhiều máy.
+    # Trong phiên bản này, ta vẫn dùng tracker để ổn định ID.
+    tracks = state.tracker.update(raw_dets) if state.tracker else []
+    if not tracks:
+        # Fallback to detections if tracker is missing
+        tracks = raw_dets
 
-        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+    faces_data = []
 
-        # Label background
-        label = f"{name} ({sim:.0%})" if pid else ("Real" if is_real else "FAKE")
-        liveness = " [SPOOF]" if not is_real else ""
-        full_label = label + liveness
-        (tw, th), _ = cv2.getTextSize(full_label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
-        cv2.rectangle(out, (x1, y1 - th - 8), (x1 + tw + 6, y1), color, -1)
-        cv2.putText(out, full_label, (x1 + 3, y1 - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
+    for t in tracks:
+        tid = t.get("track_id", hash(str(t["bbox"]))) # Fallback ID nếu không có tracker
+        bbox = t["bbox"]
+        conf = t["conf"]
+        kps = t.get("kps")
 
-    # FPS overlay
-    cv2.putText(out, f"FPS: {state.fps:.1f}", (10, 28),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 200), 2, cv2.LINE_AA)
-    return out
+        aligned = state.aligner.align(frame, kps=kps, bbox=bbox) if state.aligner else None
 
+        # Embed
+        emb = None
+        if aligned is not None and state.embedder:
+            cached_emb = state.embed_cache.get(tid) if state.embed_cache else None
+            if cached_emb is None:
+                emb = state.embedder.embed(aligned)
+                if emb is not None and state.embed_cache:
+                    state.embed_cache.set(tid, emb, conf)
+            else:
+                emb = cached_emb
 
-def _camera_loop():
-    """Vòng lặp đọc frame từ camera (thread riêng)."""
-    cap = cv2.VideoCapture(CAMERA_INDEX)
-    if not cap.isOpened():
-        log.error("Không thể mở camera index %d", CAMERA_INDEX)
-        return
+        # Search identity
+        person_id, similarity = None, None
+        if tid in state.identity_cache:
+            person_id, similarity = state.identity_cache[tid]
+        elif emb is not None and state.feature_store:
+            match = state.feature_store.searcher.search(emb)
+            if match:
+                person_id, similarity = match
+            state.identity_cache[tid] = (person_id, similarity)
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
-    cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    state._cap = cap
+        # Liveness
+        is_real = True
+        spoof_score = 1.0
+        if tid in state.liveness_cache:
+            is_real, spoof_score = state.liveness_cache[tid]
+        elif aligned is not None and state.anti_spoof:
+            if state.anti_spoof._model is not None:
+                is_real, spoof_score = state.anti_spoof.is_real(aligned)
+                state.liveness_cache[tid] = (is_real, spoof_score)
 
-    frame_q: queue.Queue = queue.Queue(maxsize=FRAME_QUEUE_MAXSIZE)
-    state._frame_q = frame_q
-    log.info("Camera started (index=%d, %dx%d @ %dfps)", CAMERA_INDEX, CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS)
+        # Fetch name
+        name = "Unknown"
+        if person_id:
+            if person_id not in state.db_names and state.db:
+                p = state.db.get_person(person_id)
+                state.db_names[person_id] = p.full_name if p else "Unknown"
+            name = state.db_names.get(person_id, "Unknown")
 
-    while state._running:
-        ret, frame = cap.read()
-        if not ret:
-            time.sleep(0.05)
-            continue
-        if frame_q.full():
-            try:
-                frame_q.get_nowait()
-            except queue.Empty:
-                pass
-        frame_q.put_nowait(frame)
+        faces_data.append({
+            "track_id": tid,
+            "bbox": list(bbox),
+            "conf": float(conf),
+            "person_id": person_id,
+            "similarity": float(similarity) if similarity else None,
+            "is_real": is_real,
+            "name": name,
+        })
 
-    cap.release()
-    log.info("Camera stopped.")
-
-
-def _process_loop():
-    """Vòng lặp xử lý AI trên frame (thread riêng)."""
-    from core.pipeline.tracker import FaceTracker
-    from core.pipeline.anti_spoof import AntiSpoof
-
-    frame_skip = 0
-    skip_counter = 0
-    last_dets = []
-    last_time = 0.0
-    fps_ema = 0.0
-    identity_cache: Dict[int, tuple] = {}
-    liveness_cache: Dict[int, tuple] = {}
-
-    while state._running:
-        if not hasattr(state, '_frame_q'):
-            time.sleep(0.1)
-            continue
-
-        try:
-            frame = state._frame_q.get(timeout=0.5)
-        except queue.Empty:
-            continue
-
-        t0 = time.perf_counter()
-
-        # Detection
-        skip_counter = (skip_counter + 1) % (frame_skip + 1)
-        if skip_counter == 0 and state.detector:
-            raw_dets = state.detector.detect(frame)
-            last_dets = raw_dets
-        else:
-            raw_dets = last_dets
-
-        # Track
-        tracks = state.tracker.update(raw_dets) if state.tracker else []
-
-        # Active track IDs
-        active_tids = {t["track_id"] for t in tracks}
-        for tid in list(identity_cache.keys()):
-            if tid not in active_tids:
-                del identity_cache[tid]
-        for tid in list(liveness_cache.keys()):
-            if tid not in active_tids:
-                del liveness_cache[tid]
-
-        faces_data = []
-        db_names: Dict[int, str] = {}
-
-        for t in tracks:
-            tid = t["track_id"]
-            bbox = t["bbox"]
-            conf = t["conf"]
-            kps = t.get("kps")
-
-            aligned = state.aligner.align(frame, kps=kps, bbox=bbox) if state.aligner else None
-
-            # Embed
-            emb = None
-            if aligned is not None and state.embedder:
-                cached_emb = state.embed_cache.get(tid) if state.embed_cache else None
-                if cached_emb is None:
-                    emb = state.embedder.embed(aligned)
-                    if emb is not None and state.embed_cache:
-                        state.embed_cache.set(tid, emb, conf)
-                else:
-                    emb = cached_emb
-
-            # Search identity
-            person_id, similarity = None, None
-            if tid in identity_cache:
-                person_id, similarity = identity_cache[tid]
-            elif emb is not None and state.feature_store:
-                match = state.feature_store.searcher.search(emb)
-                if match:
-                    person_id, similarity = match
-                identity_cache[tid] = (person_id, similarity)
-
-            # Liveness
-            is_real = True
-            if tid in liveness_cache:
-                is_real, _ = liveness_cache[tid]
-            elif aligned is not None and state.anti_spoof:
-                if state.anti_spoof._model is not None:
-                    is_real, score = state.anti_spoof.is_real(aligned)
-                    liveness_cache[tid] = (is_real, score)
-
-            # Fetch name
-            name = "Unknown"
-            if person_id:
-                if person_id not in db_names and state.db:
-                    p = state.db.get_person(person_id)
-                    db_names[person_id] = p.full_name if p else "Unknown"
-                name = db_names.get(person_id, "Unknown")
-
-            faces_data.append({
-                "track_id": tid,
-                "bbox": list(bbox),
-                "conf": float(conf),
-                "person_id": person_id,
-                "similarity": float(similarity) if similarity else None,
-                "is_real": is_real,
-                "name": name,
-            })
-
-        # FPS
-        now = time.perf_counter()
-        if last_time > 0:
-            elapsed = now - last_time
-            curr = 1.0 / elapsed if elapsed > 0 else 0
-            fps_ema = 0.9 * fps_ema + 0.1 * curr
-        last_time = now
-
-        # Draw and store
-        rendered = _draw_overlay(frame, faces_data)
-        with state._frame_lock:
-            state.latest_frame = rendered
-            state.latest_faces = faces_data
-            state.fps = fps_ema
-
-    log.info("Processor thread stopped.")
+    process_time_ms = int((time.perf_counter() - t0) * 1000)
+    return {"faces": faces_data, "process_time_ms": process_time_ms}
 
 
 # ── Lifespan (startup/shutdown) ────────────────────────────────────────────────
@@ -287,19 +165,10 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         log.warning("Sync FAISS lỗi: %s", exc)
 
-    # Start camera + processor threads
-    state._running = True
-    state.camera_thread = threading.Thread(target=_camera_loop, daemon=True, name="camera")
-    state.processor_thread = threading.Thread(target=_process_loop, daemon=True, name="processor")
-    state.camera_thread.start()
-    state.processor_thread.start()
-    log.info("Server ready.")
-
+    log.info("Server ready. (Waiting for client connections)")
     yield
 
-    # Shutdown
     log.info("Shutting down...")
-    state._running = False
     if state.feature_store:
         state.feature_store.searcher.save()
     if state.db:
@@ -309,9 +178,9 @@ async def lifespan(app: FastAPI):
 # ── FastAPI App ────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title="Face Recognition API",
-    description="API nhận diện khuôn mặt real-time với camera, FAISS và ArcFace.",
-    version="1.0.0",
+    title="Face Recognition API (Edge-Cloud)",
+    description="API nhận diện khuôn mặt xử lý ảnh từ Client gửi lên (Stateless).",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -322,46 +191,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Serve static web files
 web_dir = Path(__file__).parent / "web"
 web_dir.mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(web_dir)), name="static")
 
-
-# ── MJPEG Video Stream ─────────────────────────────────────────────────────────
-
-def _generate_mjpeg():
-    """Generator trả về MJPEG frames liên tục."""
-    while True:
-        with state._frame_lock:
-            frame = state.latest_frame
-
-        if frame is None:
-            # Placeholder khi chưa có frame
-            placeholder = np.zeros((480, 640, 3), dtype=np.uint8)
-            cv2.putText(placeholder, "Waiting for camera...", (120, 240),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (180, 180, 180), 2)
-            frame = placeholder
-
-        ret, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
-        if ret:
-            yield (
-                b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n"
-            )
-        time.sleep(1.0 / 30)  # ~30 FPS stream
-
-
-@app.get("/video_feed", tags=["Stream"])
-def video_feed():
-    """MJPEG live stream — nhúng vào thẻ <img> trong HTML."""
-    return StreamingResponse(
-        _generate_mjpeg(),
-        media_type="multipart/x-mixed-replace; boundary=frame",
-    )
-
-
-# ── REST API ───────────────────────────────────────────────────────────────────
+# ── REST API Endpoints ─────────────────────────────────────────────────────────
 
 class PersonCreate(BaseModel):
     full_name: str
@@ -369,7 +203,6 @@ class PersonCreate(BaseModel):
     id_number: Optional[str] = None
     gender: Optional[str] = None
     phone: Optional[str] = None
-
 
 class PersonUpdate(PersonCreate):
     pass
@@ -380,41 +213,36 @@ def get_status():
     """Trạng thái hệ thống."""
     return {
         "status": "running",
-        "camera_active": state._running and state.latest_frame is not None,
-        "fps": round(state.fps, 1),
         "models_loaded": state.detector is not None,
         "total_persons": len(state.db.list_persons()) if state.db else 0,
     }
 
 
-@app.get("/api/recognize", tags=["Recognition"])
-def get_recognition():
-    """Kết quả nhận diện khuôn mặt của frame mới nhất."""
-    with state._frame_lock:
-        faces = state.latest_faces.copy()
-        fps = state.fps
-    return {"fps": round(fps, 1), "faces": faces}
+@app.post("/api/recognize_image", tags=["Recognition"])
+async def recognize_image(file: UploadFile = File(...)):
+    """(Dành cho IoT/Camera) Gửi 1 file ảnh lên để nhận diện."""
+    contents = await file.read()
+    nparr = np.frombuffer(contents, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    
+    if img is None:
+        raise HTTPException(status_code=400, detail="Invalid image file")
+
+    result = process_frame_stateless(img, client_id="rest_api")
+    return JSONResponse(content=result)
 
 
 @app.get("/api/persons", tags=["Persons"])
 def list_persons(search: str = ""):
-    """Danh sách tất cả người đã đăng ký."""
-    if not state.db:
-        raise HTTPException(503, "DB chưa sẵn sàng")
-    persons = state.db.list_persons(search=search)
-    return [p.to_dict() for p in persons]
-
+    if not state.db: raise HTTPException(503, "DB chưa sẵn sàng")
+    return [p.to_dict() for p in state.db.list_persons(search=search)]
 
 @app.get("/api/persons/{person_id}", tags=["Persons"])
 def get_person(person_id: int):
-    """Thông tin một người."""
-    if not state.db:
-        raise HTTPException(503, "DB chưa sẵn sàng")
+    if not state.db: raise HTTPException(503, "DB chưa sẵn sàng")
     p = state.db.get_person(person_id)
-    if not p:
-        raise HTTPException(404, f"Không tìm thấy person_id={person_id}")
+    if not p: raise HTTPException(404, "Không tìm thấy người dùng")
     return p.to_dict()
-
 
 @app.post("/api/persons", tags=["Persons"])
 async def create_person(
@@ -425,20 +253,9 @@ async def create_person(
     phone: Optional[str] = Form(None),
     photo: Optional[UploadFile] = File(None),
 ):
-    """Thêm người mới và đăng ký khuôn mặt."""
-    if not state.db:
-        raise HTTPException(503, "DB chưa sẵn sàng")
+    if not state.db: raise HTTPException(503, "DB chưa sẵn sàng")
 
-    person = Person(
-        id=None,
-        full_name=full_name,
-        dob=dob,
-        id_number=id_number,
-        gender=gender,
-        phone=phone,
-    )
-
-    # Xử lý ảnh
+    person = Person(id=None, full_name=full_name, dob=dob, id_number=id_number, gender=gender, phone=phone)
     face_img = None
     embeddings = []
 
@@ -446,123 +263,106 @@ async def create_person(
         content = await photo.read()
         arr = np.frombuffer(content, dtype=np.uint8)
         img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if img is None:
-            raise HTTPException(400, "Ảnh không hợp lệ")
+        if img is None: raise HTTPException(400, "Ảnh không hợp lệ")
 
-        # Detect & align
         if state.detector and state.aligner:
             dets = state.detector.detect(img)
-            if not dets:
-                raise HTTPException(400, "Không phát hiện khuôn mặt trong ảnh")
-            d = dets[0]
-            aligned = state.aligner.align(img, kps=d.get("kps"), bbox=d["bbox"])
+            if not dets: raise HTTPException(400, "Không phát hiện khuôn mặt")
+            aligned = state.aligner.align(img, kps=dets[0].get("kps"), bbox=dets[0]["bbox"])
             face_img = aligned
             if state.embedder and aligned is not None:
                 emb = state.embedder.embed(aligned)
-                if emb is not None:
-                    embeddings.append(emb)
+                if emb is not None: embeddings.append(emb)
 
-    # Save photo
     photo_path_str = None
     if face_img is not None:
         from utils.config import FACES_DIR
         FACES_DIR.mkdir(parents=True, exist_ok=True)
-        tmp_id = int(time.time() * 1000)
-        fname = f"face_{tmp_id}.jpg"
-        fpath = FACES_DIR / fname
-        cv2.imwrite(str(fpath), face_img)
-        photo_path_str = fname
-        person.photo_path = photo_path_str
+        fname = f"face_{int(time.time() * 1000)}.jpg"
+        cv2.imwrite(str(FACES_DIR / fname), face_img)
+        person.photo_path = fname
 
     pid = state.db.add_person(person)
-
-    # Register embeddings
     if embeddings and state.feature_store:
         state.feature_store.register(pid, embeddings)
 
-    return {"success": True, "person_id": pid, "embeddings_registered": len(embeddings)}
+    # Xoá cache identity vì có người mới
+    state.identity_cache.clear()
+    state.db_names.clear()
 
-
-@app.put("/api/persons/{person_id}", tags=["Persons"])
-def update_person(person_id: int, data: PersonUpdate):
-    """Cập nhật thông tin người."""
-    if not state.db:
-        raise HTTPException(503, "DB chưa sẵn sàng")
-    existing = state.db.get_person(person_id)
-    if not existing:
-        raise HTTPException(404, f"Không tìm thấy person_id={person_id}")
-    existing.full_name = data.full_name
-    existing.dob = data.dob
-    existing.id_number = data.id_number
-    existing.gender = data.gender
-    existing.phone = data.phone
-    state.db.update_person(existing)
-    return {"success": True}
-
+    return {"success": True, "person_id": pid}
 
 @app.delete("/api/persons/{person_id}", tags=["Persons"])
 def delete_person(person_id: int):
-    """Xoá người và embedding."""
-    if not state.db or not state.feature_store:
-        raise HTTPException(503, "DB chưa sẵn sàng")
+    if not state.db or not state.feature_store: raise HTTPException(503, "DB chưa sẵn sàng")
     existing = state.db.get_person(person_id)
-    if not existing:
-        raise HTTPException(404, f"Không tìm thấy person_id={person_id}")
-    # Remove photo
+    if not existing: raise HTTPException(404, "Không tìm thấy")
     if existing.photo_path:
         from utils.config import FACES_DIR
         p = FACES_DIR / existing.photo_path
-        if p.exists():
-            p.unlink()
+        if p.exists(): p.unlink()
     state.feature_store.unregister(person_id)
     state.db.delete_person(person_id)
+    
+    state.identity_cache.clear()
+    state.db_names.clear()
     return {"success": True}
-
-
-@app.get("/api/snapshot", tags=["Stream"])
-def get_snapshot():
-    """Chụp ảnh frame hiện tại, trả về base64 JPEG."""
-    with state._frame_lock:
-        frame = state.latest_frame
-
-    if frame is None:
-        raise HTTPException(503, "Camera chưa sẵn sàng")
-
-    ret, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-    if not ret:
-        raise HTTPException(500, "Encode ảnh thất bại")
-    b64 = base64.b64encode(buf.tobytes()).decode()
-    return {"image": f"data:image/jpeg;base64,{b64}"}
-
 
 @app.get("/api/persons/{person_id}/photo", tags=["Persons"])
 def get_person_photo(person_id: int):
-    """Trả về ảnh khuôn mặt của người."""
     from fastapi.responses import FileResponse
     from utils.config import FACES_DIR
-    if not state.db:
-        raise HTTPException(503, "DB chưa sẵn sàng")
-    p = state.db.get_person(person_id)
-    if not p or not p.photo_path:
-        raise HTTPException(404, "Không có ảnh")
+    p = state.db.get_person(person_id) if state.db else None
+    if not p or not p.photo_path: raise HTTPException(404, "Không có ảnh")
     fpath = FACES_DIR / p.photo_path
-    if not fpath.exists():
-        raise HTTPException(404, "File ảnh không tồn tại")
+    if not fpath.exists(): raise HTTPException(404, "File không tồn tại")
     return FileResponse(str(fpath), media_type="image/jpeg")
+
+
+# ── WebSocket Endpoint (Dành cho WebRTC / Browser Streaming) ───────────────────
+
+@app.websocket("/ws/recognize")
+async def websocket_recognize(websocket: WebSocket):
+    """
+    Client (Trình duyệt) gửi frames liên tục dưới dạng Base64 hoặc bytes.
+    Server phân tích và gửi lại JSON kết quả (bounding box, tên).
+    """
+    await websocket.accept()
+    client_ip = websocket.client.host if websocket.client else "unknown"
+    log.info(f"WebSocket Client connected: {client_ip}")
+
+    try:
+        while True:
+            # Nhận dữ liệu text (base64) hoặc bytes. Ưu tiên nhận bytes để nhanh.
+            data = await websocket.receive_bytes()
+            
+            # Giải mã JPEG
+            nparr = np.frombuffer(data, np.uint8)
+            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            
+            if frame is not None:
+                # Xử lý frame
+                result = process_frame_stateless(frame, client_id=client_ip)
+                
+                # Trả JSON về cho Client để tự vẽ lên Canvas
+                await websocket.send_json(result)
+            else:
+                await websocket.send_json({"error": "Decode failed"})
+
+    except WebSocketDisconnect:
+        log.info(f"WebSocket Client disconnected: {client_ip}")
+    except Exception as e:
+        log.error(f"WebSocket Error ({client_ip}): {e}")
 
 
 # ── Serve HTML UI ──────────────────────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 def index():
-    """Serve giao diện web chính."""
     html_path = web_dir / "index.html"
     if html_path.exists():
         return HTMLResponse(html_path.read_text(encoding="utf-8"))
     return HTMLResponse("<h1>index.html not found</h1>", status_code=404)
-
-
-# ── Entrypoint ─────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
