@@ -4,9 +4,11 @@ import queue
 import time
 from typing import Optional
 
-from PyQt5.QtCore import QThread, pyqtSignal
+# from PyQt5.QtCore import QThread, pyqtSignal  # Removed for headless server
 
-from utils.config import CAMERA_INDEX, CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS, FRAME_QUEUE_MAXSIZE
+# PyQt5 import removed – not needed in headless server
+
+# Camera config imports retained for possible future use
 from utils.logger import get_logger
 
 log = get_logger(__name__)

@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 
 import numpy as np
-from PyQt5.QtCore import QThread, pyqtSignal
+# from PyQt5.QtCore import QThread, pyqtSignal  # Removed for headless server
 
 from utils.config import FRAME_SKIP, UI_TARGET_FPS
 from utils.logger import get_logger
